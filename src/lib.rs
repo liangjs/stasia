@@ -4,7 +4,7 @@ use std::hash::Hash;
 
 pub trait Variable
 where
-    Self: Hash + Copy,
+    Self: Hash + Copy + Eq,
 {
     /// Create a series of new variables.
     /// The original variable (`self`) is still valid.
@@ -24,21 +24,22 @@ pub trait CFGNode<'a> {
     type Instruction: DefUseVars<Variable = Self::Variable> + 'a;
     type InstIter: Iterator<Item = &'a Self::Instruction>;
     type InstIterMut: Iterator<Item = &'a mut Self::Instruction>;
-    fn instructions(&'a self) -> Self::InstIter;
-    fn instructions_mut(&'a mut self) -> Self::InstIterMut;
+    fn instructions(&self) -> Self::InstIter;
+    fn instructions_mut(&mut self) -> Self::InstIterMut;
     fn prepend_phi(&mut self, src: Vec<Self::Variable>, dst: Self::Variable);
 }
 
-pub trait CFG
+pub trait CFG<'a>
 where
     Self: graph_visit::GraphBase<NodeId = NodeIndex>,
     Self: graph_visit::Data<NodeWeight = Self::Node>,
     Self: graph_visit::GraphProp<EdgeType = petgraph::Directed>,
     Self: graph_visit::IntoNeighborsDirected,
     Self: graph_visit::IntoNodeReferences,
+    Self: graph_visit::Visitable,
     Self: graph_data::DataMapMut,
 {
-    type Node: for<'a> CFGNode<'a>;
+    type Node: CFGNode<'a>;
 }
 
 mod ssa;
