@@ -1,6 +1,6 @@
 use petgraph::algo::dominators;
 use petgraph::visit::NodeRef;
-use std::cell::RefCell;
+use std::cell::{RefCell, RefMut};
 use std::collections::{HashMap, HashSet};
 use std::marker::PhantomData;
 
@@ -84,7 +84,7 @@ pub struct SSA<Graph, Var> {
     dom_fronts: Vec<HashSet<usize>>,
     node_phi: Vec<Vec<PhiVar<Var>>>,
     new_vars: HashMap<Var, Vec<Var>>,
-    new_var_cache: RefCell<Vec<HashMap<Var, Var>>>,
+    new_var_cache: RefCell<HashMap<(usize, usize), HashMap<Var, Var>>>,
     _phantom: PhantomData<Graph>,
 }
 
@@ -113,35 +113,35 @@ where
     pub fn analysis(graph: Graph, entry: NodeIndex) {
         let mut state = SSA::<Graph, Var>::new();
         state.entry = entry;
-        state.node_list = SSA::init_node_list(graph);
-        state.node_id = SSA::<Graph, Var>::init_node_id(&state.node_list);
-        state.node_insts = SSA::init_new_insts(graph, &state.node_list);
-        state.node_dvars = SSA::<Graph, Var>::init_node_dvars(&state.node_insts);
+        state.node_list = state.init_node_list(graph);
+        state.node_id = state.init_node_id();
+        state.node_insts = state.init_new_insts(graph);
+        state.node_dvars = state.init_node_dvars();
         state.doms = Some(dominators::simple_fast(graph, entry));
         state.dom_fronts = state.dominance_frontiers(graph);
         state.node_phi = state.find_needed_phi_vars();
         state.new_vars = state.create_new_vars();
-        state.new_var_cache = RefCell::new(vec![HashMap::new(); state.node_list.len()]);
+        state.new_var_cache = RefCell::new(HashMap::new());
         state.assign_dvars();
         state.assign_phi_args(graph);
         state.flush(graph);
     }
 
-    fn init_node_list(graph: Graph) -> Vec<NodeIndex> {
+    fn init_node_list(&self, graph: Graph) -> Vec<NodeIndex> {
         graph.node_references().map(|node| node.id()).collect()
     }
 
-    fn init_node_id(node_list: &Vec<NodeIndex>) -> HashMap<NodeIndex, usize> {
-        node_list
+    fn init_node_id(&self) -> HashMap<NodeIndex, usize> {
+        self.node_list
             .iter()
             .enumerate()
             .map(|(id, node)| (*node, id))
             .collect()
     }
 
-    fn init_new_insts(graph: Graph, node_list: &Vec<NodeIndex>) -> Vec<Vec<Instruction<Var>>> {
+    fn init_new_insts(&self, graph: Graph) -> Vec<Vec<Instruction<Var>>> {
         let mut node_insts = Vec::new();
-        for node in node_list.iter() {
+        for node in self.node_list.iter() {
             let weight = graph.node_weight(*node).unwrap().borrow();
             let insts = weight.instructions().map(Instruction::<Var>::new).collect();
             node_insts.push(insts);
@@ -149,11 +149,11 @@ where
         node_insts
     }
 
-    fn init_node_dvars(node_insts: &Vec<Vec<Instruction<Var>>>) -> Vec<HashSet<Var>> {
+    fn init_node_dvars(&self) -> Vec<HashSet<Var>> {
         let mut node_dvars = Vec::new();
-        for node in 0..node_insts.len() {
+        for node in 0..self.node_insts.len() {
             let mut dvars = HashSet::new();
-            for inst in node_insts[node].iter() {
+            for inst in self.node_insts[node].iter() {
                 if let Some(var) = inst.old_dvar() {
                     dvars.insert(var);
                 }
@@ -169,13 +169,20 @@ where
         for node in graph.node_references() {
             let node = node.id();
             let cur_node = *self.node_id.get(&node).unwrap();
+            let mut is_entry = 0;
             let idom = match doms.immediate_dominator(node) {
-                None => continue,
+                None => {
+                    if node != self.entry {
+                        continue;
+                    }
+                    is_entry = 1;
+                    node
+                }
                 Some(x) => x,
             };
             let preds: Vec<NodeIndex> =
                 graph.neighbors_directed(node, petgraph::Incoming).collect();
-            if preds.len() < 2 {
+            if preds.len() + is_entry < 2 {
                 continue;
             }
             for pred in preds {
@@ -257,6 +264,9 @@ where
             for phi_id in 0..self.node_phi[id].len() {
                 let pvar = &self.node_phi[id][phi_id];
                 let mut args = HashSet::new();
+                if node == self.entry {
+                    args.insert(pvar.old.clone());
+                }
                 for pred in preds.iter() {
                     let arg = self.find_def_at_end(&pvar.old, *pred);
                     args.insert(arg);
@@ -279,17 +289,43 @@ where
 
     fn find_def_at_end(&self, var: &Var, node: NodeIndex) -> Var {
         let id = *self.node_id.get(&node).unwrap();
-        let mut cache = self.new_var_cache.borrow_mut();
-        let entry = cache[id].entry(var.clone());
-        return (*entry
-            .or_insert_with(|| self.find_def_nocache(var, id, self.node_insts[id].len())))
-        .clone();
+        self.find_def(var, id, self.node_insts[id].len())
     }
 
-    fn find_def_nocache(&self, var: &Var, id: usize, last_inst_id: usize) -> Var {
+    fn find_def_cache(
+        &self,
+        var: &Var,
+        id: usize,
+        last_inst_id: usize,
+        cache: &mut RefMut<HashMap<(usize, usize), HashMap<Var, Var>>>,
+    ) -> Var {
+        let var_map = cache.entry((id, last_inst_id)).or_insert(HashMap::new());
+        if let Some(ans) = var_map.get(var) {
+            return ans.clone();
+        }
+        let ans = self.find_def_nocache(var, id, last_inst_id, cache);
+        cache
+            .get_mut(&(id, last_inst_id))
+            .unwrap()
+            .insert(var.clone(), ans.clone());
+        ans
+    }
+
+    fn find_def(&self, var: &Var, id: usize, last_inst_id: usize) -> Var {
+        let mut cache = self.new_var_cache.borrow_mut();
+        self.find_def_cache(var, id, last_inst_id, &mut cache)
+    }
+
+    fn find_def_nocache(
+        &self,
+        var: &Var,
+        id: usize,
+        last_inst_id: usize,
+        cache: &mut RefMut<HashMap<(usize, usize), HashMap<Var, Var>>>,
+    ) -> Var {
         let node = self.node_list[id];
         if self.node_dvars[id].contains(var) && last_inst_id > 0 {
-            for inst_id in last_inst_id - 1..0 {
+            for inst_id in (0..last_inst_id).rev() {
                 let inst = &self.node_insts[id][inst_id];
                 if let Some(dvar) = inst.dvar.as_ref() {
                     if dvar.old.eq(var) {
@@ -307,7 +343,8 @@ where
             return var.clone();
         }
         let idom = self.doms.as_ref().unwrap().immediate_dominator(node);
-        return self.find_def_at_end(var, idom.unwrap());
+        let idom = *self.node_id.get(&idom.unwrap()).unwrap();
+        return self.find_def_cache(var, idom, self.node_insts[idom].len(), cache);
     }
 
     fn get_new_var(&self, old: &Var, new: usize) -> Var {
@@ -333,7 +370,7 @@ where
                     inst.replace_def_var(new_var);
                 }
                 for uvar in myinst.uvars.iter() {
-                    let new_var = self.find_def_nocache(uvar, id, inst_id);
+                    let new_var = self.find_def(uvar, id, inst_id);
                     inst.replace_use_var(uvar, new_var)
                 }
             }
