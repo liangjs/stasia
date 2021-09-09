@@ -2,24 +2,20 @@ use petgraph::algo::dominators;
 use petgraph::visit::NodeRef;
 use std::cell::RefCell;
 use std::collections::{HashMap, HashSet};
+use std::marker::PhantomData;
 
 use crate::*;
 
-type Var<'a, Graph> = <<Graph as CFG<'a>>::Node as CFGNode<'a>>::Variable;
-type VarSet<'a, Graph> = HashSet<Var<'a, Graph>>;
-type VarVec<'a, Graph> = Vec<Var<'a, Graph>>;
-type VarMap<'a, Graph, Value> = HashMap<Var<'a, Graph>, Value>;
-type VarMapVec<'a, Graph> = VarMap<'a, Graph, VarVec<'a, Graph>>;
-
-type Inst<'a, Graph> = <<Graph as CFG<'a>>::Node as CFGNode<'a>>::Instruction;
-
-struct RepVar<'a, Graph: CFG<'a>> {
-    old: Var<'a, Graph>,
+struct RepVar<Var> {
+    old: Var,
     new: Option<usize>,
 }
 
-impl<'a, Graph: CFG<'a>> RepVar<'a, Graph> {
-    fn from_old(old: Var<'a, Graph>) -> RepVar<'a, Graph> {
+impl<Var> RepVar<Var>
+where
+    Var: Variable,
+{
+    fn from_old(old: Var) -> RepVar<Var> {
         RepVar { old, new: None }
     }
     fn set_new(&mut self, new: usize) {
@@ -27,35 +23,41 @@ impl<'a, Graph: CFG<'a>> RepVar<'a, Graph> {
     }
 }
 
-struct Instruction<'a, Graph: CFG<'a>> {
-    dvar: Option<RepVar<'a, Graph>>,
-    uvar: VarVec<'a, Graph>,
+struct Instruction<Var> {
+    dvar: Option<RepVar<Var>>,
+    uvars: Vec<Var>,
 }
 
-impl<'a, Graph: CFG<'a>> Instruction<'a, Graph> {
-    fn new(inst: &Inst<'a, Graph>) -> Instruction<'a, Graph> {
+impl<Var> Instruction<Var>
+where
+    Var: Variable,
+{
+    fn new<Inst>(inst: &Inst) -> Instruction<Var>
+    where
+        Inst: DefUseVars<Variable = Var>,
+    {
         Instruction {
             dvar: inst
                 .defined_var()
                 .and_then(|var| Some(RepVar::from_old(var))),
-            uvar: inst.used_vars(),
+            uvars: inst.used_vars(),
         }
     }
 
-    fn old_dvar(&self) -> Option<Var<'a, Graph>> {
-        self.dvar.as_ref().and_then(|rv| Some(rv.old))
+    fn old_dvar(&self) -> Option<Var> {
+        self.dvar.as_ref().and_then(|rv| Some(rv.old.clone()))
     }
 }
 
 #[derive(Clone)]
-struct PhiVar<'a, Graph: CFG<'a>> {
-    old: Var<'a, Graph>,
+struct PhiVar<Var> {
+    old: Var,
     new: usize,
-    phi_args: VarVec<'a, Graph>,
+    phi_args: Vec<Var>,
 }
 
-impl<'a, Graph: CFG<'a>> PhiVar<'a, Graph> {
-    fn from_old(old: Var<'a, Graph>) -> PhiVar<'a, Graph> {
+impl<Var> PhiVar<Var> {
+    fn from_old(old: Var) -> PhiVar<Var> {
         PhiVar {
             old,
             new: usize::MAX,
@@ -67,96 +69,112 @@ impl<'a, Graph: CFG<'a>> PhiVar<'a, Graph> {
         self.new = new;
     }
 
-    fn add_arg(&mut self, var: Var<'a, Graph>) {
+    fn add_arg(&mut self, var: Var) {
         self.phi_args.push(var);
     }
 }
 
-struct SSA<'a, Graph: CFG<'a>> {
-    graph: Graph,
+pub struct SSA<Graph, Var> {
     entry: NodeIndex,
     doms: Option<dominators::Dominators<NodeIndex>>,
     node_list: Vec<NodeIndex>,
     node_id: HashMap<NodeIndex, usize>,
-    node_insts: Vec<Vec<Instruction<'a, Graph>>>,
-    node_dvars: Vec<VarSet<'a, Graph>>,
+    node_insts: Vec<Vec<Instruction<Var>>>,
+    node_dvars: Vec<HashSet<Var>>,
     dom_fronts: Vec<HashSet<usize>>,
-    node_phi: Vec<Vec<PhiVar<'a, Graph>>>,
-    new_vars: VarMapVec<'a, Graph>,
-    new_var_cache: RefCell<Vec<VarMap<'a, Graph, Var<'a, Graph>>>>,
+    node_phi: Vec<Vec<PhiVar<Var>>>,
+    new_vars: HashMap<Var, Vec<Var>>,
+    new_var_cache: RefCell<Vec<HashMap<Var, Var>>>,
+    _phantom: PhantomData<Graph>,
 }
 
-impl<'a, Graph: CFG<'a>> SSA<'a, Graph> {
-    pub fn new(graph: Graph, entry: NodeIndex) -> SSA<'a, Graph> {
-        let node_list: Vec<NodeIndex> = graph.node_references().map(|node| node.id()).collect();
-        let node_id: HashMap<NodeIndex, usize> = node_list
-            .iter()
-            .enumerate()
-            .map(|(id, node)| (*node, id))
-            .collect();
-        let node_insts = node_list
-            .iter()
-            .map(|node| {
-                graph
-                    .node_weight(*node)
-                    .unwrap()
-                    .instructions()
-                    .map(Instruction::new)
-                    .collect()
-            })
-            .collect();
+impl<Graph, Var> SSA<Graph, Var>
+where
+    Graph: CFG,
+    Var: Variable,
+    <Graph as CFG>::Node: for<'a> CFGNode<'a, Variable = Var>,
+{
+    pub fn new() -> SSA<Graph, Var> {
         SSA {
-            graph,
-            entry,
-            node_list,
-            node_id,
-            node_insts,
+            entry: NodeIndex::end(),
+            node_list: Default::default(),
+            node_id: Default::default(),
+            node_insts: Default::default(),
             doms: None,
             dom_fronts: Default::default(),
             node_dvars: Default::default(),
             node_phi: Default::default(),
             new_vars: Default::default(),
             new_var_cache: Default::default(),
+            _phantom: Default::default(),
         }
     }
 
-    pub fn analysis(&mut self) {
-        self.init_node_defined_vars();
-        self.dominance_frontiers();
-        self.find_needed_phi_vars();
-        self.create_new_vars();
-        self.assign_dvars();
-        self.assign_phi_args();
-        self.flush();
+    pub fn analysis(graph: Graph, entry: NodeIndex) {
+        let mut state = SSA::<Graph, Var>::new();
+        state.entry = entry;
+        state.node_list = SSA::init_node_list(graph);
+        state.node_id = SSA::<Graph, Var>::init_node_id(&state.node_list);
+        state.node_insts = SSA::init_new_insts(graph, &state.node_list);
+        state.node_dvars = SSA::<Graph, Var>::init_node_dvars(&state.node_insts);
+        state.doms = Some(dominators::simple_fast(graph, entry));
+        state.dom_fronts = state.dominance_frontiers(graph);
+        state.node_phi = state.find_needed_phi_vars();
+        state.new_vars = state.create_new_vars();
+        state.new_var_cache = RefCell::new(vec![HashMap::new(); state.node_list.len()]);
+        state.assign_dvars();
+        state.assign_phi_args(graph);
+        state.flush(graph);
     }
 
-    fn init_node_defined_vars(&mut self) {
-        self.node_dvars = Vec::new();
-        for node in 0..self.node_list.len() {
+    fn init_node_list(graph: Graph) -> Vec<NodeIndex> {
+        graph.node_references().map(|node| node.id()).collect()
+    }
+
+    fn init_node_id(node_list: &Vec<NodeIndex>) -> HashMap<NodeIndex, usize> {
+        node_list
+            .iter()
+            .enumerate()
+            .map(|(id, node)| (*node, id))
+            .collect()
+    }
+
+    fn init_new_insts(graph: Graph, node_list: &Vec<NodeIndex>) -> Vec<Vec<Instruction<Var>>> {
+        let mut node_insts = Vec::new();
+        for node in node_list.iter() {
+            let weight = graph.node_weight(*node).unwrap().borrow();
+            let insts = weight.instructions().map(Instruction::<Var>::new).collect();
+            node_insts.push(insts);
+        }
+        node_insts
+    }
+
+    fn init_node_dvars(node_insts: &Vec<Vec<Instruction<Var>>>) -> Vec<HashSet<Var>> {
+        let mut node_dvars = Vec::new();
+        for node in 0..node_insts.len() {
             let mut dvars = HashSet::new();
-            for inst in self.node_insts[node].iter() {
+            for inst in node_insts[node].iter() {
                 if let Some(var) = inst.old_dvar() {
                     dvars.insert(var);
                 }
             }
-            self.node_dvars.push(dvars);
+            node_dvars.push(dvars);
         }
+        node_dvars
     }
 
-    fn dominance_frontiers(&mut self) {
-        self.dom_fronts = vec![HashSet::new(); self.node_list.len()];
-        let doms = dominators::simple_fast(self.graph, self.entry);
-        for node in self.graph.node_references() {
+    fn dominance_frontiers(&self, graph: Graph) -> Vec<HashSet<usize>> {
+        let mut dom_fronts = vec![HashSet::new(); self.node_list.len()];
+        let doms = self.doms.as_ref().unwrap();
+        for node in graph.node_references() {
             let node = node.id();
             let cur_node = *self.node_id.get(&node).unwrap();
             let idom = match doms.immediate_dominator(node) {
                 None => continue,
                 Some(x) => x,
             };
-            let preds: Vec<NodeIndex> = self
-                .graph
-                .neighbors_directed(node, petgraph::Incoming)
-                .collect();
+            let preds: Vec<NodeIndex> =
+                graph.neighbors_directed(node, petgraph::Incoming).collect();
             if preds.len() < 2 {
                 continue;
             }
@@ -164,30 +182,30 @@ impl<'a, Graph: CFG<'a>> SSA<'a, Graph> {
                 let mut runner = pred;
                 while runner != idom {
                     let runner_id = *self.node_id.get(&runner).unwrap();
-                    self.dom_fronts[runner_id].insert(cur_node);
+                    dom_fronts[runner_id].insert(cur_node);
                     runner = doms.immediate_dominator(runner).unwrap();
                 }
             }
         }
-        self.doms = Some(doms);
+        dom_fronts
     }
 
-    fn find_needed_phi_vars(&mut self) {
-        let mut need_phi: Vec<VarSet<'a, Graph>> = vec![HashSet::new(); self.node_list.len()];
+    fn find_needed_phi_vars(&self) -> Vec<Vec<PhiVar<Var>>> {
+        let mut need_phi: Vec<HashSet<Var>> = vec![HashSet::new(); self.node_list.len()];
         for node in 0..self.node_list.len() {
             for front in self.dom_fronts[node].iter() {
                 for var in self.node_dvars[node].iter() {
-                    need_phi[*front].insert(*var);
+                    need_phi[*front].insert(var.clone());
                 }
             }
         }
-        self.node_phi = need_phi
+        need_phi
             .into_iter()
             .map(|vars| vars.into_iter().map(PhiVar::from_old).collect())
-            .collect();
+            .collect()
     }
 
-    fn create_new_vars(&mut self) {
+    fn create_new_vars(&self) -> HashMap<Var, Vec<Var>> {
         let mut var_count = HashMap::new();
         for insts in self.node_insts.iter() {
             for inst in insts.iter() {
@@ -198,19 +216,18 @@ impl<'a, Graph: CFG<'a>> SSA<'a, Graph> {
         }
         for phi_vars in self.node_phi.iter() {
             for var in phi_vars.iter() {
-                *var_count.entry(var.old).or_insert(0) += 1;
+                *var_count.entry(var.old.clone()).or_insert(0) += 1;
             }
         }
-        self.new_vars = var_count
+        var_count
             .iter()
-            .map(|(var, count)| (*var, var.split(*count)))
-            .collect();
-        self.new_var_cache = RefCell::new(vec![HashMap::new(); self.node_list.len()]);
+            .map(|(var, count)| (var.clone(), var.split(*count)))
+            .collect()
     }
 
     fn assign_dvars(&mut self) {
-        let mut var_count: VarMap<'a, Graph, usize> =
-            self.new_vars.keys().map(|var| (*var, 0)).collect();
+        let mut var_count: HashMap<Var, usize> =
+            self.new_vars.keys().map(|var| (var.clone(), 0)).collect();
         for insts in self.node_insts.iter_mut() {
             for inst in insts.iter_mut() {
                 if let Some(dvar) = inst.dvar.as_mut() {
@@ -229,21 +246,19 @@ impl<'a, Graph: CFG<'a>> SSA<'a, Graph> {
         }
     }
 
-    fn assign_phi_args(&mut self) {
+    fn assign_phi_args(&mut self, graph: Graph) {
         for (id, node) in self.node_list.iter().enumerate() {
             let node = *node;
             if !self.reachable(node) {
                 continue;
             }
-            let preds: Vec<NodeIndex> = self
-                .graph
-                .neighbors_directed(node, petgraph::Incoming)
-                .collect();
+            let preds: Vec<NodeIndex> =
+                graph.neighbors_directed(node, petgraph::Incoming).collect();
             for phi_id in 0..self.node_phi[id].len() {
                 let pvar = &self.node_phi[id][phi_id];
                 let mut args = HashSet::new();
                 for pred in preds.iter() {
-                    let arg = self.find_def_at_end(pvar.old, *pred);
+                    let arg = self.find_def_at_end(&pvar.old, *pred);
                     args.insert(arg);
                 }
                 let pvar = &mut self.node_phi[id][phi_id];
@@ -262,74 +277,66 @@ impl<'a, Graph: CFG<'a>> SSA<'a, Graph> {
         doms.immediate_dominator(node).is_some()
     }
 
-    fn find_def_at_end(&self, var: Var<'a, Graph>, node: NodeIndex) -> Var<'a, Graph> {
+    fn find_def_at_end(&self, var: &Var, node: NodeIndex) -> Var {
         let id = *self.node_id.get(&node).unwrap();
         let mut cache = self.new_var_cache.borrow_mut();
-        let entry = cache[id].entry(var);
-        return *entry.or_insert_with(|| self.find_def_nocache(var, id, self.node_insts[id].len()));
+        let entry = cache[id].entry(var.clone());
+        return (*entry
+            .or_insert_with(|| self.find_def_nocache(var, id, self.node_insts[id].len())))
+        .clone();
     }
 
-    fn find_def_nocache(&self, var: Var<'a, Graph>, id: usize, last_inst_id: usize) -> Var<'a, Graph> {
+    fn find_def_nocache(&self, var: &Var, id: usize, last_inst_id: usize) -> Var {
         let node = self.node_list[id];
-        if self.node_dvars[id].contains(&var) && last_inst_id > 0 {
-            for inst_id in last_inst_id-1..0 {
+        if self.node_dvars[id].contains(var) && last_inst_id > 0 {
+            for inst_id in last_inst_id - 1..0 {
                 let inst = &self.node_insts[id][inst_id];
                 if let Some(dvar) = inst.dvar.as_ref() {
-                    if dvar.old == var {
+                    if dvar.old.eq(var) {
                         return self.get_new_var(var, dvar.new.unwrap());
                     }
                 }
             }
         }
         for pvar in self.node_phi[id].iter() {
-            if pvar.old == var {
+            if pvar.old.eq(var) {
                 return self.get_new_var(var, pvar.new);
             }
         }
         if node == self.entry {
-            return var;
+            return var.clone();
         }
         let idom = self.doms.as_ref().unwrap().immediate_dominator(node);
         return self.find_def_at_end(var, idom.unwrap());
     }
 
-    fn get_new_var(&self, old: Var<'a, Graph>, new: usize) -> Var<'a, Graph> {
-        self.new_vars.get(&old).unwrap()[new]
+    fn get_new_var(&self, old: &Var, new: usize) -> Var {
+        self.new_vars.get(old).unwrap()[new].clone()
     }
 
-    fn flush(&mut self) {
+    fn flush(&self, graph: Graph) {
         for id in 0..self.node_list.len() {
             let node = self.node_list[id];
             if !self.reachable(node) {
                 continue;
             }
+            let mut weight = graph.node_weight(node).unwrap().borrow_mut();
             for pvar_id in 0..self.node_phi[id].len() {
                 let pvar = self.node_phi[id][pvar_id].clone();
-                let new_var = self.get_new_var(pvar.old, pvar.new);
-                self.flush_phi(node, pvar.phi_args, new_var);
+                let new_var = self.get_new_var(&pvar.old, pvar.new);
+                weight.prepend_phi(pvar.phi_args, new_var);
             }
-            let weight = self.graph.node_weight_mut(node).unwrap();
             for (inst_id, inst) in weight.instructions_mut().enumerate() {
                 let myinst = &self.node_insts[id][inst_id];
                 if let Some(dvar) = myinst.dvar.as_ref() {
-                    let new_var = self.get_new_var(dvar.old, dvar.new.unwrap());
+                    let new_var = self.get_new_var(&dvar.old, dvar.new.unwrap());
                     inst.replace_def_var(new_var);
                 }
-                for uvar in myinst.uvar.iter() {
-                    let uvar = *uvar;
+                for uvar in myinst.uvars.iter() {
                     let new_var = self.find_def_nocache(uvar, id, inst_id);
                     inst.replace_use_var(uvar, new_var)
                 }
             }
         }
     }
-
-    fn flush_phi(&mut self, node: NodeIndex, src: Vec<Var<'a, Graph>>, dst: Var<'a, Graph>) {
-        let weight = self.graph.node_weight_mut(node).unwrap();
-        weight.prepend_phi(src, dst);
-    }
-}
-
-pub fn ssa_analysis<'a, Graph: CFG<'a>>(graph: Graph, entry: NodeIndex) {
-    SSA::new(graph, entry).analysis();
 }
