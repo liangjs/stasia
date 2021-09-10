@@ -1,7 +1,7 @@
 use petgraph::algo::dominators;
 use petgraph::visit::NodeRef;
 use std::cell::{RefCell, RefMut};
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::marker::PhantomData;
 
 use crate::*;
@@ -170,16 +170,13 @@ where
             let node = node.id();
             let cur_node = *self.node_id.get(&node).unwrap();
             let mut is_entry = 0;
-            let idom = match doms.immediate_dominator(node) {
-                None => {
-                    if node != self.entry {
-                        continue;
-                    }
-                    is_entry = 1;
-                    node
+            let idom = doms.immediate_dominator(node);
+            if idom.is_none() {
+                if node != self.entry {
+                    continue;
                 }
-                Some(x) => x,
-            };
+                is_entry = 1;
+            }
             let preds: Vec<NodeIndex> =
                 graph.neighbors_directed(node, petgraph::Incoming).collect();
             if preds.len() + is_entry < 2 {
@@ -187,10 +184,14 @@ where
             }
             for pred in preds {
                 let mut runner = pred;
-                while runner != idom {
+                while Some(runner) != idom {
                     let runner_id = *self.node_id.get(&runner).unwrap();
                     dom_fronts[runner_id].insert(cur_node);
-                    runner = doms.immediate_dominator(runner).unwrap();
+                    let up = doms.immediate_dominator(runner);
+                    if up == idom {
+                        break;
+                    }
+                    runner = up.unwrap();
                 }
             }
         }
@@ -200,9 +201,16 @@ where
     fn find_needed_phi_vars(&self) -> Vec<Vec<PhiVar<Var>>> {
         let mut need_phi: Vec<HashSet<Var>> = vec![HashSet::new(); self.node_list.len()];
         for node in 0..self.node_list.len() {
-            for front in self.dom_fronts[node].iter() {
-                for var in self.node_dvars[node].iter() {
-                    need_phi[*front].insert(var.clone());
+            for var in self.node_dvars[node].iter() {
+                let mut queue: VecDeque<usize> =
+                    self.dom_fronts[node].clone().into_iter().collect();
+                while let Some(front) = queue.pop_front() {
+                    if need_phi[front].insert(var.clone()) {
+                        for new_front in self.dom_fronts[front].iter() {
+                            let new_front = *new_front;
+                            queue.push_back(new_front);
+                        }
+                    }
                 }
             }
         }

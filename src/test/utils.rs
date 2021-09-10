@@ -181,6 +181,7 @@ impl crate::Variable for Variable {
     }
 }
 
+#[allow(dead_code)]
 pub fn dot_view<'a>(graph: &'a ControlFlowGraph, entry: NodeIndex) -> String {
     let config = [dot::Config::EdgeNoLabel, dot::Config::NodeNoLabel];
     let edge_attr = |_, _| String::new();
@@ -315,7 +316,7 @@ pub fn random_test_seeded(
     let ((graph, entry), var_pool) =
         random_cfg(&mut rng, var_num, node_num, inst_num, use_num, density);
     ssa_analysis(&graph, entry);
-    println!("{}", dot_view(&graph, entry));
+    //println!("{}", dot_view(&graph, entry));
     Checker::check(&graph, entry, &var_pool);
 }
 
@@ -411,7 +412,7 @@ impl Checker {
         }
         for (node_id, node) in graph.node_references() {
             let node = node.borrow();
-            for (inst_id, inst) in node.instructions().enumerate() {
+            for (inst_id, inst) in node.instructions.iter().enumerate() {
                 if let Some(var) = inst.new_dvar.clone() {
                     var_defs2.insert(var, (node_id, inst_id));
                 }
@@ -435,10 +436,13 @@ impl Checker {
         }
         for (node_id, node) in graph.node_references() {
             let node = node.borrow();
-            for (inst_id, inst) in node.instructions().enumerate() {
+            for (inst_id, inst) in node.instructions.iter().enumerate() {
                 if let Some(var) = inst.dvar.clone() {
                     Checker::flush_def_var(graph, &mut var_defs, node_id, inst_id, &var);
                 }
+            }
+            for pvar in node.phi_vars.iter() {
+                Checker::flush_def_var(graph, &mut var_defs, node_id, usize::MAX, &pvar.dst);
             }
         }
         var_defs
@@ -453,25 +457,27 @@ impl Checker {
     ) {
         let mut queue = VecDeque::new();
         let mut visit = HashSet::new();
-        visit.insert((node_id, inst_id));
-        queue.push_back((node_id, inst_id));
+        for next in Checker::next_instruction(graph, node_id, inst_id) {
+            if !visit.contains(&next) {
+                visit.insert(next);
+                queue.push_back(next);
+            }
+        }
         while let Some(front) = queue.pop_front() {
             let (fr_node, fr_inst) = front;
-            if (fr_node != node_id || fr_inst != inst_id) && fr_inst != usize::MAX {
-                let defs = var_defs.get_mut(&fr_node).unwrap();
-                if fr_inst < defs.len() {
-                    let defs = &mut defs[fr_inst];
-                    let entry = defs.entry(var.clone()).or_insert(Vec::new());
-                    entry.push((node_id, inst_id));
-                }
+            let defs = var_defs.get_mut(&fr_node).unwrap();
+            if fr_inst < defs.len() {
+                let defs = &mut defs[fr_inst];
+                let entry = defs.entry(var.clone()).or_insert(Vec::new());
+                entry.push((node_id, inst_id));
+            }
+            let cur_node = graph.node_weight(fr_node).unwrap().borrow();
+            if fr_inst < cur_node.instructions.len()
+                && cur_node.instructions[fr_inst].dvar == Some(var.clone())
+            {
+                continue;
             }
             for next in Checker::next_instruction(graph, fr_node, fr_inst) {
-                let next_node = graph.node_weight(next.0).unwrap().borrow();
-                if next.1 < next_node.instructions.len()
-                    && next_node.instructions[next.1].dvar == Some(var.clone())
-                {
-                    continue;
-                }
                 if !visit.contains(&next) {
                     visit.insert(next);
                     queue.push_back(next);
