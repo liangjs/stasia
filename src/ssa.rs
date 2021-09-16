@@ -53,7 +53,7 @@ where
 struct PhiVar<Var> {
     old: Var,
     new: usize,
-    phi_args: Vec<Var>,
+    phi_args: Vec<usize>,
 }
 
 impl<Var> PhiVar<Var> {
@@ -69,12 +69,15 @@ impl<Var> PhiVar<Var> {
         self.new = new;
     }
 
-    fn add_arg(&mut self, var: Var) {
-        self.phi_args.push(var);
+    fn add_arg(&mut self, id: usize) {
+        self.phi_args.push(id);
     }
 }
 
-pub struct SSA<Graph, Var> {
+pub struct Analyser<Graph, Node, Var>
+where
+    Var: Variable,
+{
     entry: NodeIndex,
     doms: Option<dominators::Dominators<NodeIndex>>,
     node_list: Vec<NodeIndex>,
@@ -83,19 +86,19 @@ pub struct SSA<Graph, Var> {
     node_dvars: Vec<HashSet<Var>>,
     dom_fronts: Vec<HashSet<usize>>,
     node_phi: Vec<Vec<PhiVar<Var>>>,
-    new_vars: HashMap<Var, Vec<Var>>,
-    new_var_cache: RefCell<HashMap<(usize, usize), HashMap<Var, Var>>>,
-    _phantom: PhantomData<Graph>,
+    new_vars: HashMap<Var, Vec<usize>>,
+    new_var_cache: RefCell<HashMap<(usize, usize), HashMap<Var, usize>>>,
+    _phantom: PhantomData<(Graph, Node)>,
 }
 
-impl<Graph, Var> SSA<Graph, Var>
+impl<Graph, Node, Var> Analyser<Graph, Node, Var>
 where
-    Graph: CFG,
+    Graph: CFG<Node>,
     Var: Variable,
-    <Graph as CFG>::Node: for<'a> CFGNode<'a, Variable = Var>,
+    Node: for<'a> CFGNode<'a, Variable = Var>,
 {
-    pub fn new() -> SSA<Graph, Var> {
-        SSA {
+    pub fn new() -> Analyser<Graph, Node, Var> {
+        Analyser {
             entry: NodeIndex::end(),
             node_list: Default::default(),
             node_id: Default::default(),
@@ -110,8 +113,8 @@ where
         }
     }
 
-    pub fn analysis(graph: Graph, entry: NodeIndex) {
-        let mut state = SSA::<Graph, Var>::new();
+    pub fn analysis(graph: Graph, entry: NodeIndex) -> HashMap<NodeIndex, SSA<Var>> {
+        let mut state = Analyser::new();
         state.entry = entry;
         state.node_list = state.init_node_list(graph);
         state.node_id = state.init_node_id();
@@ -124,7 +127,7 @@ where
         state.new_var_cache = RefCell::new(HashMap::new());
         state.assign_dvars();
         state.assign_phi_args(graph);
-        state.flush(graph);
+        state.flush()
     }
 
     fn init_node_list(&self, graph: Graph) -> Vec<NodeIndex> {
@@ -142,7 +145,7 @@ where
     fn init_new_insts(&self, graph: Graph) -> Vec<Vec<Instruction<Var>>> {
         let mut node_insts = Vec::new();
         for node in self.node_list.iter() {
-            let weight = graph.node_weight(*node).unwrap().borrow();
+            let weight = graph.node_weight(*node).unwrap();
             let insts = weight.instructions().map(Instruction::<Var>::new).collect();
             node_insts.push(insts);
         }
@@ -220,29 +223,30 @@ where
             .collect()
     }
 
-    fn create_new_vars(&self) -> HashMap<Var, Vec<Var>> {
+    fn create_new_vars(&self) -> HashMap<Var, Vec<usize>> {
         let mut var_count = HashMap::new();
         for insts in self.node_insts.iter() {
             for inst in insts.iter() {
                 if let Some(var) = inst.old_dvar() {
-                    *var_count.entry(var).or_insert(0) += 1;
+                    *var_count.entry(var).or_insert(1) += 1;
                 }
             }
         }
         for phi_vars in self.node_phi.iter() {
             for var in phi_vars.iter() {
-                *var_count.entry(var.old.clone()).or_insert(0) += 1;
+                *var_count.entry(var.old.clone()).or_insert(1) += 1;
             }
         }
-        var_count
-            .iter()
-            .map(|(var, count)| (var.clone(), var.split(*count)))
-            .collect()
+        let mut new_vars = HashMap::new();
+        for (var, cnt) in var_count.iter() {
+            new_vars.insert(var.clone(), (0..*cnt).collect());
+        }
+        new_vars
     }
 
     fn assign_dvars(&mut self) {
         let mut var_count: HashMap<Var, usize> =
-            self.new_vars.keys().map(|var| (var.clone(), 0)).collect();
+            self.new_vars.keys().map(|var| (var.clone(), 1)).collect();
         for insts in self.node_insts.iter_mut() {
             for inst in insts.iter_mut() {
                 if let Some(dvar) = inst.dvar.as_mut() {
@@ -273,11 +277,10 @@ where
                 let pvar = &self.node_phi[id][phi_id];
                 let mut args = HashSet::new();
                 if node == self.entry {
-                    args.insert(pvar.old.clone());
+                    args.insert(0);
                 }
                 for pred in preds.iter() {
-                    let arg = self.find_def_at_end(&pvar.old, *pred);
-                    args.insert(arg);
+                    args.insert(self.find_def_at_end(&pvar.old, *pred));
                 }
                 let pvar = &mut self.node_phi[id][phi_id];
                 for arg in args.into_iter() {
@@ -295,7 +298,7 @@ where
         doms.immediate_dominator(node).is_some()
     }
 
-    fn find_def_at_end(&self, var: &Var, node: NodeIndex) -> Var {
+    fn find_def_at_end(&self, var: &Var, node: NodeIndex) -> usize {
         let id = *self.node_id.get(&node).unwrap();
         self.find_def(var, id, self.node_insts[id].len())
     }
@@ -305,11 +308,11 @@ where
         var: &Var,
         id: usize,
         last_inst_id: usize,
-        cache: &mut RefMut<HashMap<(usize, usize), HashMap<Var, Var>>>,
-    ) -> Var {
+        cache: &mut RefMut<HashMap<(usize, usize), HashMap<Var, usize>>>,
+    ) -> usize {
         let var_map = cache.entry((id, last_inst_id)).or_insert(HashMap::new());
         if let Some(ans) = var_map.get(var) {
-            return ans.clone();
+            return *ans;
         }
         let ans = self.find_def_nocache(var, id, last_inst_id, cache);
         cache
@@ -319,7 +322,7 @@ where
         ans
     }
 
-    fn find_def(&self, var: &Var, id: usize, last_inst_id: usize) -> Var {
+    fn find_def(&self, var: &Var, id: usize, last_inst_id: usize) -> usize {
         let mut cache = self.new_var_cache.borrow_mut();
         self.find_def_cache(var, id, last_inst_id, &mut cache)
     }
@@ -329,59 +332,65 @@ where
         var: &Var,
         id: usize,
         last_inst_id: usize,
-        cache: &mut RefMut<HashMap<(usize, usize), HashMap<Var, Var>>>,
-    ) -> Var {
+        cache: &mut RefMut<HashMap<(usize, usize), HashMap<Var, usize>>>,
+    ) -> usize {
         let node = self.node_list[id];
         if self.node_dvars[id].contains(var) && last_inst_id > 0 {
             for inst_id in (0..last_inst_id).rev() {
                 let inst = &self.node_insts[id][inst_id];
                 if let Some(dvar) = inst.dvar.as_ref() {
                     if dvar.old.eq(var) {
-                        return self.get_new_var(var, dvar.new.unwrap());
+                        return dvar.new.unwrap();
                     }
                 }
             }
         }
         for pvar in self.node_phi[id].iter() {
             if pvar.old.eq(var) {
-                return self.get_new_var(var, pvar.new);
+                return pvar.new;
             }
         }
         if node == self.entry {
-            return var.clone();
+            return 0;
         }
         let idom = self.doms.as_ref().unwrap().immediate_dominator(node);
         let idom = *self.node_id.get(&idom.unwrap()).unwrap();
         return self.find_def_cache(var, idom, self.node_insts[idom].len(), cache);
     }
 
-    fn get_new_var(&self, old: &Var, new: usize) -> Var {
-        self.new_vars.get(old).unwrap()[new].clone()
-    }
-
-    fn flush(&self, graph: Graph) {
+    fn flush(&self) -> HashMap<NodeIndex, SSA<Var>> {
+        let mut ans = HashMap::new();
         for id in 0..self.node_list.len() {
             let node = self.node_list[id];
             if !self.reachable(node) {
                 continue;
             }
-            let mut weight = graph.node_weight(node).unwrap().borrow_mut();
-            for pvar_id in 0..self.node_phi[id].len() {
-                let pvar = self.node_phi[id][pvar_id].clone();
-                let new_var = self.get_new_var(&pvar.old, pvar.new);
-                weight.prepend_phi(pvar.phi_args, new_var);
+            let mut ssa_phi = Vec::new();
+            for pvar in self.node_phi[id].iter() {
+                ssa_phi.push(PhiStmt {
+                    var: pvar.old.clone(),
+                    src: pvar.phi_args.clone(),
+                    dst: pvar.new,
+                });
             }
-            for (inst_id, inst) in weight.instructions_mut().enumerate() {
-                let myinst = &self.node_insts[id][inst_id];
-                if let Some(dvar) = myinst.dvar.as_ref() {
-                    let new_var = self.get_new_var(&dvar.old, dvar.new.unwrap());
-                    inst.replace_def_var(new_var);
+            let mut ssa_inst = Vec::new();
+            for (inst_id, inst) in self.node_insts[id].iter().enumerate() {
+                let def_var = inst.dvar.as_ref().and_then(|rv| rv.new);
+                let mut use_vars = HashMap::new();
+                for uvar in inst.uvars.iter() {
+                    let new_uvar = self.find_def(uvar, id, inst_id);
+                    use_vars.insert(uvar.clone(), new_uvar);
                 }
-                for uvar in myinst.uvars.iter() {
-                    let new_var = self.find_def(uvar, id, inst_id);
-                    inst.replace_use_var(uvar, new_var)
-                }
+                ssa_inst.push(InstStmt { def_var, use_vars });
             }
+            ans.insert(
+                node,
+                SSA {
+                    phi: ssa_phi,
+                    inst: ssa_inst,
+                },
+            );
         }
+        ans
     }
 }

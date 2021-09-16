@@ -1,19 +1,17 @@
-use std::cell::RefCell;
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::iter::FromIterator;
 
 use petgraph::graph::NodeIndex;
+use petgraph::visit::IntoNodeIdentifiers;
 use petgraph::{dot, visit::IntoNodeReferences};
 use rand::{prelude::SliceRandom, Rng, SeedableRng};
 use rand_chacha::ChaCha8Rng;
 
-use crate::{ssa_analysis, CFGNode, DefUseVars, CFG};
+use crate::{ssa_analysis, CFGNode, DefUseVars, CFG, SSA};
 
-pub type ControlFlowGraph = petgraph::graph::DiGraph<RefCell<Node>, ()>;
+pub type ControlFlowGraph = petgraph::graph::DiGraph<Node, ()>;
 
-impl CFG for &ControlFlowGraph {
-    type Node = Node;
-}
+impl CFG<Node> for &ControlFlowGraph {}
 
 #[derive(Debug)]
 pub struct Node {
@@ -49,18 +47,9 @@ impl<'a> CFGNode<'a> for Node {
     type Variable = Variable;
     type Instruction = Instruction;
     type InstIter = std::slice::Iter<'a, Instruction>;
-    type InstIterMut = std::slice::IterMut<'a, Instruction>;
 
     fn instructions(&'a self) -> Self::InstIter {
         self.instructions.iter()
-    }
-
-    fn instructions_mut(&'a mut self) -> Self::InstIterMut {
-        self.instructions.iter_mut()
-    }
-
-    fn prepend_phi(&mut self, src: Vec<Self::Variable>, dst: Self::Variable) {
-        self.phi_vars.push(PhiVar { src, dst });
     }
 }
 
@@ -137,19 +126,6 @@ impl DefUseVars for Instruction {
     fn used_vars(&self) -> Vec<Self::Variable> {
         self.uvars.clone()
     }
-
-    fn replace_def_var(&mut self, new_var: Self::Variable) {
-        assert!(self.dvar.is_some());
-        self.new_dvar = Some(new_var);
-    }
-
-    fn replace_use_var(&mut self, old_var: &Self::Variable, new_var: Self::Variable) {
-        for (i, v) in self.uvars.iter().enumerate() {
-            if old_var.eq(v) {
-                self.new_uvars[i] = Some(new_var.clone());
-            }
-        }
-    }
 }
 
 #[derive(Clone, PartialEq, Eq, Hash, Debug)]
@@ -159,8 +135,8 @@ pub struct Variable {
 }
 
 impl Variable {
-    pub fn new(name: String) -> Variable {
-        Variable { name, id: 0 }
+    pub fn new(name: String, id: usize) -> Variable {
+        Variable { name, id }
     }
 }
 
@@ -170,16 +146,7 @@ impl ToString for Variable {
     }
 }
 
-impl crate::Variable for Variable {
-    fn split(&self, num: usize) -> Vec<Self> {
-        (0..num)
-            .map(|i| Variable {
-                name: self.name.clone(),
-                id: self.id + i + 1,
-            })
-            .collect()
-    }
-}
+impl crate::Variable for Variable {}
 
 #[allow(dead_code)]
 pub fn dot_view<'a>(graph: &'a ControlFlowGraph, entry: NodeIndex) -> String {
@@ -193,7 +160,7 @@ pub fn dot_view<'a>(graph: &'a ControlFlowGraph, entry: NodeIndex) -> String {
         } else {
             "shape=box"
         };
-        let label = &*format!("label=\"{}\"", node.1.borrow().to_string());
+        let label = &*format!("label=\"{}\"", node.1.to_string());
         [shape, label].join(",")
     };
     let view = dot::Dot::with_attr_getters(graph, &config, &edge_attr, &node_attr);
@@ -209,7 +176,7 @@ pub fn build_graph(
     let mut graph = ControlFlowGraph::with_capacity(node_num, edges.len());
     let mut node_map = HashMap::new();
     for (i, mynode) in nodes.into_iter().enumerate() {
-        let node = graph.add_node(RefCell::new(mynode));
+        let node = graph.add_node(mynode);
         node_map.insert(i, node);
     }
     for e in edges.iter() {
@@ -298,10 +265,45 @@ pub fn random_cfg<T: Rng>(
     density: f64,
 ) -> ((ControlFlowGraph, NodeIndex), Vec<Variable>) {
     let var_pool = (0..var_num)
-        .map(|id| Variable::new(format!("var{}", id)))
+        .map(|id| Variable::new(format!("var{}", id), 0))
         .collect();
     let nodes = random_nodes(rng, node_num, &var_pool, inst_num, use_num);
     (random_graph(rng, nodes, density), var_pool)
+}
+
+pub fn apply_ssa(graph: &mut ControlFlowGraph, ssa_all: &HashMap<NodeIndex, SSA<Variable>>) {
+    for id in graph.node_identifiers() {
+        let node = graph.node_weight_mut(id).unwrap();
+        let ssa = ssa_all.get(&id).unwrap();
+        for phi in ssa.phi.iter() {
+            let name = phi.var.name.clone();
+            node.phi_vars.push(PhiVar {
+                src: phi
+                    .src
+                    .iter()
+                    .map(|x| Variable::new(name.clone(), *x))
+                    .collect(),
+                dst: Variable::new(name.clone(), phi.dst),
+            });
+        }
+        for (inst_id, inst_ssa) in ssa.inst.iter().enumerate() {
+            let inst = &node.instructions[inst_id];
+            let new_dvar = inst_ssa
+                .def_var
+                .and_then(|x| Some(Variable::new(inst.dvar.as_ref().unwrap().name.clone(), x)));
+            let new_uvars = inst
+                .uvars
+                .iter()
+                .map(|v| {
+                    let x = inst_ssa.use_vars.get(v).unwrap();
+                    Some(Variable::new(v.name.clone(), *x))
+                })
+                .collect();
+            let inst = &mut node.instructions[inst_id];
+            inst.new_dvar = new_dvar;
+            inst.new_uvars = new_uvars;
+        }
+    }
 }
 
 pub fn random_test_seeded(
@@ -313,10 +315,14 @@ pub fn random_test_seeded(
     density: f64,
 ) {
     let mut rng = ChaCha8Rng::from_seed(seed);
-    let ((graph, entry), var_pool) =
+    let ((mut graph, entry), var_pool) =
         random_cfg(&mut rng, var_num, node_num, inst_num, use_num, density);
-    ssa_analysis(&graph, entry);
+
+    let ssa = ssa_analysis(&graph, entry);
+    apply_ssa(&mut graph, &ssa);
+
     //println!("{}", dot_view(&graph, entry));
+
     Checker::check(&graph, entry, &var_pool);
 }
 
@@ -346,7 +352,7 @@ impl Checker {
         state.var_defs = Checker::init_var_defs(graph, entry, var_pool);
         state.var_defs2 = Checker::init_var_defs2(graph, entry, var_pool);
         for (node_id, node) in graph.node_references() {
-            for (inst_id, inst) in node.borrow().instructions.iter().enumerate() {
+            for (inst_id, inst) in node.instructions.iter().enumerate() {
                 let defs = &state.var_defs.get(&node_id).unwrap()[inst_id];
                 for (uvar_id, uvar) in inst.uvars.iter().enumerate() {
                     let uvar_defs: HashSet<(NodeIndex, usize)> =
@@ -369,7 +375,6 @@ impl Checker {
     fn init_phi_defs(graph: &ControlFlowGraph) -> HashMap<Variable, Vec<Variable>> {
         let mut phi_defs = HashMap::new();
         for (_id, node) in graph.node_references() {
-            let node = node.borrow();
             for pvar in node.phi_vars.iter() {
                 let old_def = phi_defs.insert(pvar.dst.clone(), pvar.src.clone());
                 assert!(old_def.is_none());
@@ -411,7 +416,6 @@ impl Checker {
             var_defs2.insert(var.clone(), (entry, usize::MAX));
         }
         for (node_id, node) in graph.node_references() {
-            let node = node.borrow();
             for (inst_id, inst) in node.instructions.iter().enumerate() {
                 if let Some(var) = inst.new_dvar.clone() {
                     var_defs2.insert(var, (node_id, inst_id));
@@ -428,14 +432,12 @@ impl Checker {
     ) -> HashMap<NodeIndex, Vec<VarDef>> {
         let mut var_defs = HashMap::new();
         for (node_id, node) in graph.node_references() {
-            let node = node.borrow();
             var_defs.insert(node_id, vec![HashMap::new(); node.instructions.len()]);
         }
         for var in var_pool.iter() {
             Checker::flush_def_var(graph, &mut var_defs, entry, usize::MAX, var);
         }
         for (node_id, node) in graph.node_references() {
-            let node = node.borrow();
             for (inst_id, inst) in node.instructions.iter().enumerate() {
                 if let Some(var) = inst.dvar.clone() {
                     Checker::flush_def_var(graph, &mut var_defs, node_id, inst_id, &var);
@@ -471,7 +473,7 @@ impl Checker {
                 let entry = defs.entry(var.clone()).or_insert(Vec::new());
                 entry.push((node_id, inst_id));
             }
-            let cur_node = graph.node_weight(fr_node).unwrap().borrow();
+            let cur_node = graph.node_weight(fr_node).unwrap();
             if fr_inst < cur_node.instructions.len()
                 && cur_node.instructions[fr_inst].dvar == Some(var.clone())
             {
@@ -491,7 +493,7 @@ impl Checker {
         node_id: NodeIndex,
         inst_id: usize,
     ) -> Vec<(NodeIndex, usize)> {
-        let node = graph.node_weight(node_id).unwrap().borrow();
+        let node = graph.node_weight(node_id).unwrap();
         if inst_id == usize::MAX {
             return vec![(node_id, 0)];
         }
